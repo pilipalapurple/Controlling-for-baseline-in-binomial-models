@@ -1,0 +1,72 @@
+generate_simulation_data <- function(n_subjects = 50, n_trials = 15, 
+                                     scenario_type = "linear_logodds") {
+  # The number of subjects and trials also can be changed, which number is suitable?
+  # True parameters, can be changed
+  baseline_effect_true <- 1.0
+  treatment_effect_true <- 0.7
+  intercept <- 0.5
+  residual_effect <- 0.7
+  
+  # Generate baseline performance (log-odds scale)
+  baseline_performance <- runif(n_subjects, -0.1, 2.5)
+  
+  # Treatment assign, why unbalanced ? because you did it previously
+  treatment <- sample(rep(c(0,1), times = c(n_subjects/2-2, n_subjects/2+2)))
+  
+  # y_pre (baseline measurement)
+  prob_baseline <- plogis(baseline_performance)
+  memory_baseline <- rbinom(n_subjects, n_trials, prob = prob_baseline)
+  
+  # y_post (follow-up measurement)
+  if(scenario_type == "linear_prob") {
+    # Scenario 1: Linear on probability scale (for modelA)
+    baseline_prob_observed <- memory_baseline / n_trials
+# Is this suitable to use prob_baseline here?
+    linear_predictor <- prob_baseline * baseline_effect_true + 
+      treatment_effect_true * treatment + 
+      intercept + 
+      residual_effect * rlogis(n_subjects)
+    prob_success <- plogis(linear_predictor) 
+
+
+    
+  } else if(scenario_type == "linear_logodds") {
+    # Scenario 2: Linear on log-odds scale (for modelB)
+    linear_predictor <- baseline_performance * baseline_effect_true + 
+      treatment_effect_true * treatment + 
+      intercept + 
+      residual_effect * rlogis(n_subjects)
+    prob_success <- plogis(linear_predictor)
+    
+  } else if(scenario_type == "nonlinear_logodds") {
+    # Scenario 3: Nonlinear on log-odds scale (for modelC)
+    baseline_prob_true <- plogis(baseline_performance)
+# construct an inserted U shape, the parameters i chosen is a little bit arbitrary "1.5""0.3"
+    nonlinear_effect <- 1.5 * (baseline_prob_true - baseline_prob_true^2) - 0.3
+    
+    linear_predictor <- baseline_performance * baseline_effect_true + 
+      treatment_effect_true * treatment + 
+      intercept + 
+      nonlinear_effect +
+      residual_effect * rlogis(n_subjects)
+    prob_success <- plogis(linear_predictor)
+  }
+  
+  # Generate follow-up outcomes
+  memory_6_months <- rbinom(n_subjects, n_trials, prob = prob_success)
+  
+  # Calculate different baseline representations for models
+  baseline_prop_obs <- memory_baseline / n_trials
+  p_baseline_smoothed <- (memory_baseline + 0.5) / (n_trials + 1)
+  baseline_logodds_obs <- log(p_baseline_smoothed / (1 - p_baseline_smoothed))
+  
+  return(data.frame(
+    subject_id = 1:n_subjects,
+    treatment = treatment,
+    memory_baseline = memory_baseline,
+    memory_6_months = memory_6_months,
+    baseline_prop = baseline_prop_obs,
+    p_baseline_smoothed = p_baseline_smoothed,
+    baseline_logodds = baseline_logodds_obs
+  ))
+}
