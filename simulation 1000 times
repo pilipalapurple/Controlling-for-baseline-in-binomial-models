@@ -340,5 +340,41 @@ print(all_selection)
 
 
 
+# output
+   scenario model n_sim mean_estimate          bias
+1 Scenario1     A  1000     0.7010905  0.0010904912
+2 Scenario1     B  1000     0.7005447  0.0005446897
+3 Scenario1     C  1000     0.7019557  0.0019557083
+4 Scenario2     A  1000     0.6908967 -0.0091033118
+5 Scenario2     B  1000     0.6851928 -0.0148072010
+6 Scenario2     C  1000     0.6881549 -0.0118450513
+7 Scenario3     A  1000     0.6710924 -0.0289075763
+8 Scenario3     B  1000     0.6642271 -0.0357728764
+9 Scenario3     C  1000     0.6756113 -0.0243887041
+       rmse coverage power sd_estimate
+1 0.1969302    0.957 0.952   0.1970257
+2 0.1968075    0.956 0.956   0.1969053
+3 0.1974868    0.954 0.952   0.1975760
+4 0.2445242    0.902 0.913   0.2444769
+5 0.2445062    0.903 0.906   0.2441796
+6 0.2468721    0.905 0.901   0.2467111
+7 0.2910040    0.829 0.841   0.2897095
+8 0.2893589    0.838 0.843   0.2872828
+9 0.2899823    0.848 0.845   0.2890995
+> 
+> cat("\nModel Selection Frequencies:\n")
+
+Model Selection Frequencies:
+> print(all_selection)
+   scenario model frequency proportion
+1 Scenario1     A       516      0.516
+2 Scenario1     B       362      0.362
+3 Scenario1     C       122      0.122
+4 Scenario2     A       333      0.333
+5 Scenario2     B       249      0.249
+6 Scenario2     C       418      0.418
+7 Scenario3     A       212      0.212
+8 Scenario3     B       163      0.163
+9 Scenario3     C       625      0.625
 
 
