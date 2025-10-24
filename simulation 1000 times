@@ -1,0 +1,338 @@
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# generate datas
+generate_simulation_data <- function(n_subjects = 50, n_trials = 15, 
+                                     scenario_type = "linear_logodds") {
+  
+  # True value
+  TRUE_BASELINE_EFFECT <- 1.0
+  TRUE_TREATMENT_EFFECT <- 0.7
+  TRUE_PRACTICE_EFFECT <- 0.5
+  TRUE_ERROR_MAGNITUDE <- 0 # keep residual_effect below = 0
+  
+  # Log-odds scale
+  baseline_ability <- runif(n_subjects, -1.0, 2.5)
+  
+  # Treatment assign
+  treatment <- sample(rep(c(0,1), times = c(n_subjects/2-2, n_subjects/2+2)))
+  
+  # y_pre
+  prob_baseline <- plogis(baseline_ability)
+  memory_baseline <- rbinom(n_subjects, n_trials, prob = prob_baseline)
+  
+  # y_post
+  if(scenario_type == "linear_prob") {
+    # scenario1 proportion scale
+    baseline_prob_observed <- memory_baseline / n_trials
+    linear_predictor <- prob_baseline * TRUE_BASELINE_EFFECT + 
+      TRUE_TREATMENT_EFFECT * treatment + 
+      TRUE_PRACTICE_EFFECT + 
+      TRUE_ERROR_MAGNITUDE * rlogis(n_subjects)
+    prob_success <- plogis(linear_predictor)
+    
+  } else if(scenario_type == "linear_logodds") {
+    # scenario2 log-odds scale
+    linear_predictor <- baseline_ability * TRUE_BASELINE_EFFECT + 
+      TRUE_TREATMENT_EFFECT * treatment + 
+      TRUE_PRACTICE_EFFECT + 
+      TRUE_ERROR_MAGNITUDE * rlogis(n_subjects)
+    prob_success <- plogis(linear_predictor)
+    
+  } else if(scenario_type == "nonlinear_logodds") {
+    # scenario3 spline
+    df <- 4  # freedom
+    
+    basis <- splines::bs(baseline_ability, df = df, intercept = FALSE)
+    spline_coefs <- rnorm(df, mean = 0, sd = 1.5)
+    
+    nonlinear_effect <- basis %*% spline_coefs
+    
+    linear_predictor <- baseline_ability * TRUE_BASELINE_EFFECT + 
+      TRUE_TREATMENT_EFFECT * treatment + 
+      TRUE_PRACTICE_EFFECT + 
+      as.vector(nonlinear_effect) +  # transfer to vector
+      TRUE_ERROR_MAGNITUDE * rlogis(n_subjects)
+    
+    prob_success <- plogis(linear_predictor)
+  }
+  
+  # y_post_outcome
+  memory_6_months <- rbinom(n_subjects, n_trials, prob = prob_success)
+  
+  # return data
+  data.frame(
+    subject_id = 1:n_subjects,
+    treatment = treatment,
+    memory_baseline = memory_baseline,
+    memory_6_months = memory_6_months,
+    baseline_prop = memory_baseline / n_trials,
+    p_baseline_smoothed = (memory_baseline + 0.5) / (n_trials + 1),
+    baseline_logodds = log((memory_baseline + 0.5) / (n_trials - memory_baseline + 0.5))
+  )
+}
+
+# generate data in three scenarios
+generate_scenario1 <- function(n_subjects = 50, n_trials = 15) {
+  generate_simulation_data(n_subjects, n_trials, "linear_prob")
+}
+
+generate_scenario2 <- function(n_subjects = 50, n_trials = 15) {
+  generate_simulation_data(n_subjects, n_trials, "linear_logodds")
+}
+
+generate_scenario3 <- function(n_subjects = 50, n_trials = 15) {
+  generate_simulation_data(n_subjects, n_trials, "nonlinear_logodds")
+}
+
+# model fitting
+
+fit_all_models <- function(data) {
+  n_trials <- 15
+  results <- list()
+  
+  # initialization
+  default_results <- list(
+    modelA_coef = NA, modelB_coef = NA, modelC_coef = NA,
+    modelA_se = NA, modelB_se = NA, modelC_se = NA,
+    AIC = c(NA, NA, NA)
+  )
+  
+  tryCatch({
+    # Model A: baseline_prop
+    modelA <- glm(cbind(memory_6_months, n_trials - memory_6_months) ~
+                    treatment + baseline_prop,
+                  family = binomial(link = "logit"), data = data)
+    
+    # Model B: baseline_logodds  
+    modelB <- glm(cbind(memory_6_months, n_trials - memory_6_months) ~
+                    treatment + baseline_logodds,
+                  family = binomial(link = "logit"), data = data)
+    
+    # Model C: smooth baseline_prop
+    modelC <- gam(cbind(memory_6_months, n_trials - memory_6_months) ~
+                    treatment + s(baseline_prop),
+                  family = binomial(link = "logit"), 
+                  method = "REML", data = data)
+    
+    # check coverage and NA
+    if(!modelA$converged || !modelB$converged || 
+       any(is.na(coef(modelA))) || any(is.na(coef(modelB)))) {
+      return(default_results)
+    }
+    
+    # extract results
+    results <- list(
+      modelA_coef = as.numeric(coef(modelA)["treatment"]),
+      modelB_coef = as.numeric(coef(modelB)["treatment"]),
+      modelC_coef = as.numeric(coef(modelC)["treatment"]),
+      modelA_se = as.numeric(summary(modelA)$coefficients["treatment", "Std. Error"]),
+      modelB_se = as.numeric(summary(modelB)$coefficients["treatment", "Std. Error"]),
+      modelC_se = as.numeric(summary(modelC)$p.table["treatment", "Std. Error"]),
+      AIC = c(AIC(modelA), AIC(modelB), AIC(modelC))
+    )
+    
+    return(results)
+    
+  }, error = function(e) {
+    return(default_results)
+  })
+}
+
+
+# simulation
+
+run_scenario_simulation <- function(data_generator, scenario_name, true_effect, n_sim = 100) {
+  cat("Running", scenario_name, "...\n")
+  
+  # Pre-allocate storage for results
+  n_models <- 3
+  estimates <- matrix(NA, nrow = n_sim, ncol = n_models)
+  standard_errors <- matrix(NA, nrow = n_sim, ncol = n_models)
+  aic_values <- matrix(NA, nrow = n_sim, ncol = n_models)
+  converged <- logical(n_sim)  # Track which simulations succeeded
+  
+  for(i in 1:n_sim) {
+    if(i %% 100 == 0) cat("  ", scenario_name, "progress:", i, "/", n_sim, "\n")
+    
+    sim_data <- data_generator()
+    
+    results <- fit_all_models(sim_data)
+    
+    # Store results if all models converged successfully
+    if(!any(is.na(c(results$modelA_coef, results$modelB_coef, results$modelC_coef)))) {
+      converged[i] <- TRUE
+      estimates[i, ] <- c(results$modelA_coef, results$modelB_coef, results$modelC_coef)
+      standard_errors[i, ] <- c(results$modelA_se, results$modelB_se, results$modelC_se)
+      aic_values[i, ] <- results$AIC
+    }
+  }
+  
+  successful_sims <- sum(converged)
+  cat(scenario_name, "completed:", successful_sims, "/", n_sim, "successful simulations\n")
+  
+  # Return only successful simulation results
+  list(
+    scenario = scenario_name,
+    true_effect = true_effect,
+    n_successful = successful_sims,
+    estimates = estimates[converged, , drop = FALSE],
+    standard_errors = standard_errors[converged, , drop = FALSE],
+    aic_values = aic_values[converged, , drop = FALSE]
+  )
+}
+
+# performance
+
+analyze_simulation_results <- function(sim_results) {
+  # handle case where no simulations succeeded
+  if(sim_results$n_successful == 0) {
+    return(data.frame(
+      scenario = sim_results$scenario,
+      model = c("A", "B", "C"),
+      n_sim = 0,
+      mean_estimate = NA,
+      bias = NA,
+      rmse = NA,
+      coverage = NA,
+      power = NA,
+      sd_estimate = NA
+    ))
+  }
+  
+  performance <- data.frame()
+  models <- c("A", "B", "C")
+  
+  # calculate performance metrics for each model
+  for(i in 1:3) {
+    estimates <- sim_results$estimates[, i]
+    ses <- sim_results$standard_errors[, i]
+    
+    # remove any remaining NA values
+    valid_idx <- !is.na(estimates) & !is.na(ses)
+    estimates <- estimates[valid_idx]
+    ses <- ses[valid_idx]
+    
+    if(length(estimates) > 0) {
+      # 95CI
+      ci_lower <- estimates - 1.96 * ses
+      ci_upper <- estimates + 1.96 * ses
+      
+      # compute performance metrics
+      performance <- rbind(performance, data.frame(
+        scenario = sim_results$scenario,
+        model = models[i],
+        n_sim = length(estimates),
+        mean_estimate = mean(estimates),  # average treatment effect estimate
+        bias = mean(estimates) - sim_results$true_effect,  
+        rmse = sqrt(mean((estimates - sim_results$true_effect)^2)),  
+        coverage = mean(ci_lower <= sim_results$true_effect & ci_upper >= sim_results$true_effect),  # CI coverage rate
+        power = mean(abs(estimates / ses) > 1.96),  # statistical power
+        sd_estimate = sd(estimates) #sd
+      ))
+    } else {
+      performance <- rbind(performance, data.frame(
+        scenario = sim_results$scenario,
+        model = models[i],
+        n_sim = 0,
+        mean_estimate = NA,
+        bias = NA,
+        rmse = NA,
+        coverage = NA,
+        power = NA,
+        sd_estimate = NA
+      ))
+    }
+  }
+  
+  return(performance)
+}
+
+analyze_model_selection <- function(sim_results) {
+  if(sim_results$n_successful == 0) {
+    return(data.frame(
+      scenario = sim_results$scenario,
+      model = c("A", "B", "C"),
+      frequency = 0,
+      proportion = 0
+    ))
+  }
+  
+  # find which model has lowest AIC in each simulation
+  best_models <- apply(sim_results$aic_values, 1, function(x) {
+    if(any(is.na(x))) return(NA)
+    which.min(x)  # returns 1, 2, or 3 for models A, B, C
+  })
+  
+  best_models <- best_models[!is.na(best_models)]
+  
+  if(length(best_models) > 0) {
+    # count how often each model was selected
+    selection_freq <- table(factor(best_models, levels = 1:3, labels = c("A", "B", "C")))
+    
+    data.frame(
+      scenario = sim_results$scenario,
+      model = names(selection_freq),
+      frequency = as.numeric(selection_freq),
+      proportion = as.numeric(selection_freq) / length(best_models)
+    )
+  } else {
+    data.frame(
+      scenario = sim_results$scenario,
+      model = c("A", "B", "C"),
+      frequency = 0,
+      proportion = 0
+    )
+  }
+}
+
+# execuation
+
+cat("Starting simulation analysis...\n\n")
+
+# true treatment effects for each scenario, easy to change
+true_effects <- c(0.7, 0.7, 0.7)
+
+set.seed(9955)
+n_simulations <- 50  # test with 50 simulations first
+
+cat("Test run (50 simulations)...\n")
+sim1 <- run_scenario_simulation(generate_scenario1, "Scenario1", true_effects[1], n_simulations)
+sim2 <- run_scenario_simulation(generate_scenario2, "Scenario2", true_effects[2], n_simulations)
+sim3 <- run_scenario_simulation(generate_scenario3, "Scenario3", true_effects[3], n_simulations)
+
+if(sim1$n_successful > 0 && sim2$n_successful > 0 && sim3$n_successful > 0) {
+  cat("\nTest successful! Starting full simulation (1000 runs)...\n")
+  n_simulations <- 1000
+  
+  sim1 <- run_scenario_simulation(generate_scenario1, "Scenario1", true_effects[1], n_simulations)
+  sim2 <- run_scenario_simulation(generate_scenario2, "Scenario2", true_effects[2], n_simulations)
+  sim3 <- run_scenario_simulation(generate_scenario3, "Scenario3", true_effects[3], n_simulations)
+}
+
+cat("\nAnalyzing performance metrics...\n")
+perf1 <- analyze_simulation_results(sim1)
+perf2 <- analyze_simulation_results(sim2)
+perf3 <- analyze_simulation_results(sim3)
+
+cat("Analyzing model selection frequency...\n")
+selection1 <- analyze_model_selection(sim1)
+selection2 <- analyze_model_selection(sim2)
+selection3 <- analyze_model_selection(sim3)
+
+all_performance <- rbind(perf1, perf2, perf3)
+all_selection <- rbind(selection1, selection2, selection3)
+
+# outputs
+
+cat("\n", strrep("=", 60), "\n")
+cat("Simulation Analysis Results Summary\n")
+cat(strrep("=", 60), "\n\n")
+
+cat("Performance Metrics:\n")
+print(all_performance)
+
+cat("\nModel Selection Frequencies:\n")
+print(all_selection)
