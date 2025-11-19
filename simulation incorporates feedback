@@ -3,9 +3,6 @@ library(dplyr)
 library(ggplot2)
 library(tidyr)
 
-# ====================================================
-# I. Global Simulation Parameters
-# ====================================================
 
 # True effects (on log-odds scale)
 TRUE_BASELINE_EFFECT <- 1.0
@@ -19,28 +16,25 @@ N_SUBJECTS <- 50
 N_TRIALS <- 15
 N_SIMULATIONS <- 100 
 
-# ====================================================
-# II. Data Generation
-# ====================================================
 
-# Generates data for one simulation run
+# Data Generation
 generate_simulation_data <- function(n_subjects = N_SUBJECTS, n_trials = N_TRIALS,
                                      true_treatment_effect = TRUE_TREATMENT_EFFECT,
                                      scenario_type = "linear_logodds") {
   
-  # Latent ability and treatment assignment
+  # latent value
   baseline_ability <- runif(n_subjects, -1.0, 2.5)
   treatment <- rbinom(n = n_subjects, size = 1, prob = 0.5)
   
-  # Pre-test outcome (y_pre)
+  # y_pre
   prob_baseline <- plogis(baseline_ability)
   memory_baseline <- rbinom(n_subjects, n_trials, prob = prob_baseline)
   
-  # Calculate observed baseline metrics (used by the models)
+  # observed value
   baseline_prop_observed <- memory_baseline / n_trials
   baseline_logodds_observed <- log((memory_baseline + 0.5) / (n_trials - memory_baseline + 0.5))
   
-  # Choose covariate source for the True DGP
+  # flag
   if (USE_OBSERVED_VALUE) {
     # Use noisy observed value in DGP
     baseline_prop_value <- baseline_prop_observed
@@ -51,7 +45,7 @@ generate_simulation_data <- function(n_subjects = N_SUBJECTS, n_trials = N_TRIAL
     baseline_logodds_value <- baseline_ability
   }
   
-  # Post-test linear predictor (y_post)
+  # y_post
   if(scenario_type == "linear_prob") {
     # Scenario 1: Linear on proportion scale
     linear_predictor <- baseline_prop_value * TRUE_BASELINE_EFFECT +
@@ -61,7 +55,7 @@ generate_simulation_data <- function(n_subjects = N_SUBJECTS, n_trials = N_TRIAL
     prob_success <- plogis(linear_predictor)
     
   } else if(scenario_type == "linear_logodds") {
-    # Scenario 2: Linear on log-odds scale (correct GLM structure)
+    # Scenario 2: Linear on log-odds scale
     linear_predictor <- baseline_logodds_value * TRUE_BASELINE_EFFECT +
       true_treatment_effect * treatment +
       TRUE_PRACTICE_EFFECT +
@@ -69,7 +63,7 @@ generate_simulation_data <- function(n_subjects = N_SUBJECTS, n_trials = N_TRIAL
     prob_success <- plogis(linear_predictor)
     
   } else if(scenario_type == "nonlinear_logodds") {
-    # Scenario 3: Nonlinear (smooth) effect of baseline log-odds (correct GAM structure)
+    # Scenario 3: Spline
     df <- 4 
     basis <- splines::bs(baseline_logodds_value, df = df, intercept = FALSE)
     spline_coefs <- rnorm(df, mean = 0, sd = 0.5) # Reduced SD to prevent overly wild squiggles
@@ -84,10 +78,8 @@ generate_simulation_data <- function(n_subjects = N_SUBJECTS, n_trials = N_TRIAL
     prob_success <- plogis(linear_predictor)
   }
   
-  # Final y_post outcome
   memory_6_months <- rbinom(n_subjects, n_trials, prob = prob_success)
   
-  # Return data frame
   data.frame(
     subject_id = 1:n_subjects,
     treatment = treatment,
@@ -103,16 +95,14 @@ generate_scenario1 <- function() { generate_simulation_data(scenario_type = "lin
 generate_scenario2 <- function() { generate_simulation_data(scenario_type = "linear_logodds") }
 generate_scenario3 <- function() { generate_simulation_data(scenario_type = "nonlinear_logodds") }
 
-# ====================================================
-# III. Model Fitting
-# ====================================================
 
-# Fits all three models for one dataset
+# Model Fitting
+
 fit_all_models <- function(data) {
   n_trials <- N_TRIALS
   all_results <- list()
   
-  # Model A: Linear GLM using proportion (baseline_prop)
+  # Model A: Propotion
   tryCatch({
     modelA <- glm(cbind(memory_6_months, n_trials - memory_6_months) ~
                     treatment + baseline_prop,
@@ -134,7 +124,7 @@ fit_all_models <- function(data) {
     }
   }, error = function(e) {})
   
-  # Model B: Linear GLM using log-odds (baseline_logodds)
+  # Model B: log-odds
   tryCatch({
     modelB <- glm(cbind(memory_6_months, n_trials - memory_6_months) ~
                     treatment + baseline_logodds,
@@ -156,7 +146,7 @@ fit_all_models <- function(data) {
     }
   }, error = function(e) {})
   
-  # Model C: GAM using smooth proportion (s(baseline_prop))
+  # Model C: Spline
   tryCatch({
     modelC <- gam(cbind(memory_6_months, n_trials - memory_6_months) ~
                     treatment + s(baseline_prop),
@@ -181,7 +171,6 @@ fit_all_models <- function(data) {
     }
   }, error = function(e) {})
   
-  # Combine and return
   if (length(all_results) > 0) {
     return(bind_rows(all_results))
   } else {
@@ -191,9 +180,8 @@ fit_all_models <- function(data) {
   }
 }
 
-# ====================================================
-# IV. Simulation Runner
-# ====================================================
+
+# Simulation
 
 run_scenario_simulation <- function(data_generator, scenario_name, true_effect, n_sim) {
   cat("Running", scenario_name, "...\n")
@@ -228,9 +216,6 @@ run_scenario_simulation <- function(data_generator, scenario_name, true_effect, 
   ))
 }
 
-# ====================================================
-# V. Analysis (Fixed 'select' issue)
-# ====================================================
 
 analyze_simulation_results <- function(sim_results) {
   
@@ -295,11 +280,9 @@ analyze_model_selection <- function(sim_results) {
   )
 }
 
-# ====================================================
-# VI. Visualization
-# ====================================================
 
-# Plot CIs for a subset of runs
+# Visualization
+
 plot_simulation_results <- function(sim_results, n_plot = 50) {
   
   unique_sim_ids <- unique(sim_results$results$sim_id)
@@ -342,9 +325,8 @@ plot_simulation_results <- function(sim_results, n_plot = 50) {
   print(p)
 }
 
-# ====================================================
-# VII. Execution
-# ====================================================
+
+# Execution
 
 cat("Starting test run (N_SIMULATIONS = 50)...\n")
 N_SIMULATIONS_TEST <- 50
