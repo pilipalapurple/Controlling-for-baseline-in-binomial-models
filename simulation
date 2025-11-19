@@ -1,0 +1,403 @@
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# ====================================================
+# I. Global Simulation Parameters
+# ====================================================
+
+# True effects (on log-odds scale)
+TRUE_BASELINE_EFFECT <- 1.0
+TRUE_TREATMENT_EFFECT <- 0.7
+TRUE_PRACTICE_EFFECT <- 0.5
+TRUE_ERROR_MAGNITUDE <- 0
+USE_OBSERVED_VALUE <- FALSE
+
+# Settings
+N_SUBJECTS <- 50
+N_TRIALS <- 15
+N_SIMULATIONS <- 100 
+
+# ====================================================
+# II. Data Generation
+# ====================================================
+
+# Generates data for one simulation run
+generate_simulation_data <- function(n_subjects = N_SUBJECTS, n_trials = N_TRIALS,
+                                     true_treatment_effect = TRUE_TREATMENT_EFFECT,
+                                     scenario_type = "linear_logodds") {
+  
+  # Latent ability and treatment assignment
+  baseline_ability <- runif(n_subjects, -1.0, 2.5)
+  treatment <- rbinom(n = n_subjects, size = 1, prob = 0.5)
+  
+  # Pre-test outcome (y_pre)
+  prob_baseline <- plogis(baseline_ability)
+  memory_baseline <- rbinom(n_subjects, n_trials, prob = prob_baseline)
+  
+  # Calculate observed baseline metrics (used by the models)
+  baseline_prop_observed <- memory_baseline / n_trials
+  baseline_logodds_observed <- log((memory_baseline + 0.5) / (n_trials - memory_baseline + 0.5))
+  
+  # Choose covariate source for the True DGP
+  if (USE_OBSERVED_VALUE) {
+    # Use noisy observed value in DGP
+    baseline_prop_value <- baseline_prop_observed
+    baseline_logodds_value <- baseline_logodds_observed
+  } else {
+    # Use true latent value in DGP (default)
+    baseline_prop_value <- prob_baseline
+    baseline_logodds_value <- baseline_ability
+  }
+  
+  # Post-test linear predictor (y_post)
+  if(scenario_type == "linear_prob") {
+    # Scenario 1: Linear on proportion scale
+    linear_predictor <- baseline_prop_value * TRUE_BASELINE_EFFECT +
+      true_treatment_effect * treatment +
+      TRUE_PRACTICE_EFFECT +
+      TRUE_ERROR_MAGNITUDE * rlogis(n_subjects)
+    prob_success <- plogis(linear_predictor)
+    
+  } else if(scenario_type == "linear_logodds") {
+    # Scenario 2: Linear on log-odds scale (correct GLM structure)
+    linear_predictor <- baseline_logodds_value * TRUE_BASELINE_EFFECT +
+      true_treatment_effect * treatment +
+      TRUE_PRACTICE_EFFECT +
+      TRUE_ERROR_MAGNITUDE * rlogis(n_subjects)
+    prob_success <- plogis(linear_predictor)
+    
+  } else if(scenario_type == "nonlinear_logodds") {
+    # Scenario 3: Nonlinear (smooth) effect of baseline log-odds (correct GAM structure)
+    df <- 4 
+    basis <- splines::bs(baseline_logodds_value, df = df, intercept = FALSE)
+    spline_coefs <- rnorm(df, mean = 0, sd = 0.5) # Reduced SD to prevent overly wild squiggles
+    nonlinear_effect <- basis %*% spline_coefs
+    
+    # Correction: Use ONLY the nonlinear term, not both linear and nonlinear
+    linear_predictor <- true_treatment_effect * treatment +
+      TRUE_PRACTICE_EFFECT +
+      as.vector(nonlinear_effect) +
+      TRUE_ERROR_MAGNITUDE * rlogis(n_subjects)
+    
+    prob_success <- plogis(linear_predictor)
+  }
+  
+  # Final y_post outcome
+  memory_6_months <- rbinom(n_subjects, n_trials, prob = prob_success)
+  
+  # Return data frame
+  data.frame(
+    subject_id = 1:n_subjects,
+    treatment = treatment,
+    memory_baseline = memory_baseline,
+    memory_6_months = memory_6_months,
+    baseline_prop = memory_baseline / n_trials,
+    p_baseline_smoothed = (memory_baseline + 0.5) / (n_trials + 1),
+    baseline_logodds = log((memory_baseline + 0.5) / (n_trials - memory_baseline + 0.5))
+  )
+}
+
+generate_scenario1 <- function() { generate_simulation_data(scenario_type = "linear_prob") }
+generate_scenario2 <- function() { generate_simulation_data(scenario_type = "linear_logodds") }
+generate_scenario3 <- function() { generate_simulation_data(scenario_type = "nonlinear_logodds") }
+
+# ====================================================
+# III. Model Fitting
+# ====================================================
+
+# Fits all three models for one dataset
+fit_all_models <- function(data) {
+  n_trials <- N_TRIALS
+  all_results <- list()
+  
+  # Model A: Linear GLM using proportion (baseline_prop)
+  tryCatch({
+    modelA <- glm(cbind(memory_6_months, n_trials - memory_6_months) ~
+                    treatment + baseline_prop,
+                  family = binomial(link = "logit"), data = data)
+    converged_A <- modelA$converged && all(!is.na(coef(modelA)))
+    
+    if(converged_A) {
+      ci_A <- tryCatch(confint(modelA, parm = "treatment", level = 0.95), error = function(e) c(NA, NA))
+      if(!any(is.na(ci_A)) && !any(is.infinite(ci_A))) {
+        all_results[['A']] <- data.frame(
+          model = "A",
+          coef = as.numeric(coef(modelA)["treatment"]),
+          se = as.numeric(summary(modelA)$coefficients["treatment", "Std. Error"]),
+          ci_low = as.numeric(ci_A[1]),
+          ci_high = as.numeric(ci_A[2]),
+          AIC = AIC(modelA)
+        )
+      }
+    }
+  }, error = function(e) {})
+  
+  # Model B: Linear GLM using log-odds (baseline_logodds)
+  tryCatch({
+    modelB <- glm(cbind(memory_6_months, n_trials - memory_6_months) ~
+                    treatment + baseline_logodds,
+                  family = binomial(link = "logit"), data = data)
+    converged_B <- modelB$converged && all(!is.na(coef(modelB)))
+    
+    if(converged_B) {
+      ci_B <- tryCatch(confint(modelB, parm = "treatment", level = 0.95), error = function(e) c(NA, NA))
+      if(!any(is.na(ci_B)) && !any(is.infinite(ci_B))) {
+        all_results[['B']] <- data.frame(
+          model = "B",
+          coef = as.numeric(coef(modelB)["treatment"]),
+          se = as.numeric(summary(modelB)$coefficients["treatment", "Std. Error"]),
+          ci_low = as.numeric(ci_B[1]),
+          ci_high = as.numeric(ci_B[2]),
+          AIC = AIC(modelB)
+        )
+      }
+    }
+  }, error = function(e) {})
+  
+  # Model C: GAM using smooth proportion (s(baseline_prop))
+  tryCatch({
+    modelC <- gam(cbind(memory_6_months, n_trials - memory_6_months) ~
+                    treatment + s(baseline_prop),
+                  family = binomial(link = "logit"), method = "REML", data = data)
+    
+    # Calculate CI for GAM treatment effect
+    se_C <- as.numeric(summary(modelC)$p.table["treatment", "Std. Error"])
+    coef_C <- as.numeric(coef(modelC)["treatment"])
+    df_C <- modelC$df.residual
+    t_quant <- qt(0.975, df = df_C)
+    ci_C <- c(coef_C - t_quant * se_C, coef_C + t_quant * se_C)
+    
+    if(!is.na(coef_C) && !is.infinite(coef_C) && !any(is.na(ci_C)) && !any(is.infinite(ci_C))) {
+      all_results[['C']] <- data.frame(
+        model = "C",
+        coef = coef_C,
+        se = se_C,
+        ci_low = ci_C[1],
+        ci_high = ci_C[2],
+        AIC = AIC(modelC)
+      )
+    }
+  }, error = function(e) {})
+  
+  # Combine and return
+  if (length(all_results) > 0) {
+    return(bind_rows(all_results))
+  } else {
+    # If no model converged
+    return(data.frame(model = character(0), coef = numeric(0), se = numeric(0),
+                      ci_low = numeric(0), ci_high = numeric(0), AIC = numeric(0)))
+  }
+}
+
+# ====================================================
+# IV. Simulation Runner
+# ====================================================
+
+run_scenario_simulation <- function(data_generator, scenario_name, true_effect, n_sim) {
+  cat("Running", scenario_name, "...\n")
+  
+  all_sim_results <- list()
+  total_runs <- 0
+  
+  for(i in 1:n_sim) {
+    if(i %% 100 == 0) cat("  ", scenario_name, "progress:", i, "/", n_sim, "\n")
+    
+    sim_data <- data_generator()
+    results_df <- fit_all_models(sim_data)
+    total_runs <- total_runs + 1
+    
+    if(nrow(results_df) > 0) {
+      results_df$scenario <- scenario_name
+      results_df$sim_id <- i
+      all_sim_results[[as.character(i)]] <- results_df
+    }
+  }
+  
+  final_df <- bind_rows(all_sim_results)
+  successful_sims <- length(unique(final_df$sim_id))
+  cat(scenario_name, "completed:", successful_sims, "/", n_sim, "successful runs\n")
+  
+  return(list(
+    scenario = scenario_name,
+    true_effect = true_effect,
+    n_sim_total = n_sim,
+    n_successful = successful_sims,
+    results = final_df 
+  ))
+}
+
+# ====================================================
+# V. Analysis (Fixed 'select' issue)
+# ====================================================
+
+analyze_simulation_results <- function(sim_results) {
+  
+  df <- sim_results$results
+  true_effect <- sim_results$true_effect
+  n_sim_total <- sim_results$n_sim_total
+  
+  if(nrow(df) == 0) {
+    return(data.frame(scenario = sim_results$scenario, model = c("A", "B", "C"),
+                      n_sim_total = n_sim_total, n_sim_converged = 0,
+                      mean_estimate = NA, bias = NA, rmse = NA, coverage = NA, power = NA))
+  }
+  
+  # Calculate performance metrics
+  performance <- df %>%
+    group_by(model) %>%
+    summarise(
+      n_sim_converged = n(),
+      percent_converged = n() / n_sim_total * 100,
+      mean_estimate = mean(coef, na.rm = TRUE),
+      bias = mean_estimate - true_effect,
+      rmse = sqrt(mean((coef - true_effect)^2, na.rm = TRUE)),
+      coverage = mean(ci_low <= true_effect & ci_high >= true_effect, na.rm = TRUE),
+      power = mean(ci_low > 0 | ci_high < 0, na.rm = TRUE),
+      sd_estimate = sd(coef, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(
+      scenario = sim_results$scenario,
+      n_sim_total = n_sim_total
+    ) %>%
+    # Fixed: Use dplyr::select to prevent masking error
+    dplyr::select(scenario, model, n_sim_total, n_sim_converged, percent_converged,
+                  mean_estimate, bias, rmse, coverage, power, sd_estimate)
+  
+  return(performance)
+}
+
+# Model selection analysis
+analyze_model_selection <- function(sim_results) {
+  
+  df <- sim_results$results
+  if (nrow(df) == 0) {
+    return(data.frame(scenario = sim_results$scenario, model = c("A", "B", "C"), frequency = 0, proportion = 0))
+  }
+  
+  # Find model with min AIC for each run
+  best_models <- df %>%
+    group_by(sim_id) %>%
+    filter(AIC == min(AIC)) %>%
+    slice(1) %>% 
+    pull(model)
+  
+  selection_freq <- table(factor(best_models, levels = c("A", "B", "C")))
+  total_selected <- length(best_models)
+  
+  data.frame(
+    scenario = sim_results$scenario,
+    model = names(selection_freq),
+    frequency = as.numeric(selection_freq),
+    proportion = as.numeric(selection_freq) / total_selected
+  )
+}
+
+# ====================================================
+# VI. Visualization
+# ====================================================
+
+# Plot CIs for a subset of runs
+plot_simulation_results <- function(sim_results, n_plot = 50) {
+  
+  unique_sim_ids <- unique(sim_results$results$sim_id)
+  plot_ids <- head(unique_sim_ids, n_plot)
+  
+  if(length(plot_ids) == 0) {
+    cat("No successful simulations to plot for", sim_results$scenario, "\n")
+    return(NULL)
+  }
+  
+  plot_data <- sim_results$results %>% filter(sim_id %in% plot_ids)
+  plot_data$sim_id_factor <- factor(plot_data$sim_id, levels = plot_ids)
+  
+  p <- ggplot(plot_data, aes(x = sim_id_factor, y = coef, group = model)) +
+    
+    # True Effect Line
+    geom_hline(yintercept = sim_results$true_effect, linetype = "dashed", color = "black", alpha = 0.7) +
+    
+    # CIs
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high, color = model),
+                  position = position_dodge(width = 0.8), width = 0) +
+    
+    # Estimates
+    geom_point(aes(shape = model, color = model),
+               position = position_dodge(width = 0.8), size = 2) +
+    
+    # Settings
+    labs(title = paste("Treatment Effect CIs for", sim_results$scenario,
+                       "(First", length(plot_ids), "Runs)"),
+         x = "Simulation ID",
+         y = "Estimate (Log-Odds)") +
+    scale_color_manual(values = c("A" = "red", "B" = "yellow", "C" = "blue")) +
+    scale_shape_manual(values = c("A" = 16, "B" = 17, "C" = 15)) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, size = 6)
+    )
+  
+  print(p)
+}
+
+# ====================================================
+# VII. Execution
+# ====================================================
+
+cat("Starting test run (N_SIMULATIONS = 50)...\n")
+N_SIMULATIONS_TEST <- 50
+set.seed(9955)
+
+sim1_test <- run_scenario_simulation(generate_scenario1, "Scenario1", TRUE_TREATMENT_EFFECT, N_SIMULATIONS_TEST)
+sim2_test <- run_scenario_simulation(generate_scenario2, "Scenario2", TRUE_TREATMENT_EFFECT, N_SIMULATIONS_TEST)
+sim3_test <- run_scenario_simulation(generate_scenario3, "Scenario3", TRUE_TREATMENT_EFFECT, N_SIMULATIONS_TEST)
+
+if(sim1_test$n_successful > N_SIMULATIONS_TEST/2 && sim2_test$n_successful > N_SIMULATIONS_TEST/2 && sim3_test$n_successful > N_SIMULATIONS_TEST/2) {
+  cat("\nTest successful! Starting full simulation (N_SIMULATIONS =", N_SIMULATIONS, ")...\n")
+  
+  # Run the full simulation
+  set.seed(9955)
+  sim1 <- run_scenario_simulation(generate_scenario1, "Scenario1", TRUE_TREATMENT_EFFECT, N_SIMULATIONS)
+  sim2 <- run_scenario_simulation(generate_scenario2, "Scenario2", TRUE_TREATMENT_EFFECT, N_SIMULATIONS)
+  sim3 <- run_scenario_simulation(generate_scenario3, "Scenario3", TRUE_TREATMENT_EFFECT, N_SIMULATIONS)
+  
+} else {
+  cat("\nWarning: Test run failed. Proceeding with limited test results.\n")
+  sim1 <- sim1_test
+  sim2 <- sim2_test
+  sim3 <- sim3_test
+}
+
+# Analyze the results
+cat("\nAnalyzing performance metrics...\n")
+perf1 <- analyze_simulation_results(sim1)
+perf2 <- analyze_simulation_results(sim2)
+perf3 <- analyze_simulation_results(sim3)
+
+cat("Analyzing model selection frequency...\n")
+selection1 <- analyze_model_selection(sim1)
+selection2 <- analyze_model_selection(sim2)
+selection3 <- analyze_model_selection(sim3)
+
+# Combine and output
+all_performance <- rbind(perf1, perf2, perf3)
+all_selection <- rbind(selection1, selection2, selection3)
+
+cat("\n", strrep("=", 60), "\n")
+cat("Simulation Results Summary\n")
+cat("Parameters: N_SUBJECTS =", N_SUBJECTS, ", N_TRIALS =", N_TRIALS, ", TRUE_EFFECT =", TRUE_TREATMENT_EFFECT, "\n")
+cat("DGP Covariate Source: ", ifelse(USE_OBSERVED_VALUE, "OBSERVED", "LATENT"), "\n")
+cat(strrep("=", 60), "\n\n")
+
+cat("Performance Metrics:\n")
+print(as.data.frame(all_performance), row.names = FALSE)
+
+cat("\nModel Selection Frequencies:\n")
+print(all_selection)
+
+cat("\nPlotting a subset of CIs (First 50 successful runs):\n")
+plot_simulation_results(sim1, n_plot = 50)
+plot_simulation_results(sim2, n_plot = 50)
+plot_simulation_results(sim3, n_plot = 50)
